@@ -76,7 +76,7 @@ def satel(monkeypatch, mock_connection, mock_queue):
         "satel_integra.satel_integra.SatelConnection", lambda *a, **kw: mock_connection
     )
     monkeypatch.setattr(
-        "satel_integra.satel_integra.SatelMessageQueue", lambda send: mock_queue
+        "satel_integra.satel_integra.SatelMessageQueue", lambda send, **kw: mock_queue
     )
 
     satel = AsyncSatel(

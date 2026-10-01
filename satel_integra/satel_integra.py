@@ -11,7 +11,9 @@ from warnings import warn
 from satel_integra.commands import SatelReadCommand, SatelWriteCommand
 from satel_integra.connection import SatelConnection
 from satel_integra.const import (
+    INBOUND_SILENCE_S,
     KEEPALIVE_INTERVAL,
+    MONITORING_REFRESH_S,
     ConnectionStateCallback,
     UnsubscribeCallback,
 )
@@ -21,6 +23,8 @@ from satel_integra.exceptions import (
     SatelConnectionInitializationError,
     SatelConnectionStoppedError,
     SatelMonitoringStartError,
+    SatelNoResponseError,
+    SatelNotConnectedError,
     SatelPanelBusyError,
     SatelUnexpectedResponseError,
 )
@@ -83,6 +87,12 @@ class AlarmState(Enum):
     DISARMED = 10
 
 
+def _mask_length(msg) -> int:
+    """16 or 32 bytes - both are valid for 0x00 and 0x17; any other length falls back to 32 and
+    fails handling of that single frame only (the reading loop skips it)."""
+    return len(msg.msg_data) if len(msg.msg_data) in (16, 32) else 32
+
+
 class AsyncSatel:
     """Asynchronous interface to talk to Satel Integra alarm system."""
 
@@ -97,7 +107,11 @@ class AsyncSatel:
     ):
         """Init the Satel alarm data."""
         self._connection = SatelConnection(host, port, integration_key=integration_key)
-        self._queue = SatelMessageQueue(self._send_encoded_frame)
+        self._queue = SatelMessageQueue(
+            self._send_encoded_frame,
+            connected=lambda: self._connection.connected,
+            generation=lambda: self._connection.generation,
+        )
         self._running_tasks: set[asyncio.Task[object]] = set()
         self._closing = False
         self._connection_unavailable_logged = False
@@ -113,6 +127,11 @@ class AsyncSatel:
         self._partitions: list[int] = partitions
 
         self._alarm_status_callback: Callable[[], None] | None = None
+        # Connection generation on which monitoring was acknowledged (-1 = none)
+        self._monitoring_generation = -1
+        # Last frame FROM the panel (loop time) and the connection generation it arrived on
+        self._last_inbound: float | None = None
+        self._last_inbound_generation = -1
         self._zone_changed_callback: Callable[[dict[int, int]], None] | None = None
         self._output_changed_callback: Callable[[dict[int, int]], None] | None = None
 
@@ -172,6 +191,7 @@ class AsyncSatel:
             SatelReadCommand.OUTPUTS_STATE,
         ]
 
+        generation = self._connection.generation
         monitored_commands_bitmask = encode_bitmask_le(
             [cmd.value + 1 for cmd in monitored_commands], 12
         )
@@ -191,12 +211,18 @@ class AsyncSatel:
         if monitoring_result is None:
             raise SatelMonitoringStartError("No response to monitoring request")
 
+        was_ready = self.monitoring_ready
+        self._monitoring_generation = generation
         _LOGGER.debug("Monitoring started")
+        if not was_ready:
+            # Consumers (Home Assistant) recompute availability on this notification
+            await self._connection.notify_state_changed()
 
     def _zones_violated(self, msg: SatelReadMessage):
         status: dict[int, int] = {}
 
-        violated_zones = msg.get_active_bits(32)
+        # The protocol allows 16 and 32 bytes ("0x00 + 16/32 bytes")
+        violated_zones = msg.get_active_bits(_mask_length(msg))
         self.violated_zones = violated_zones
         _LOGGER.debug("Violated zones: %s", violated_zones)
         for zone in self._monitored_zones:
@@ -212,7 +238,7 @@ class AsyncSatel:
 
         status: dict[int, int] = {}
 
-        output_states = msg.get_active_bits(32)
+        output_states = msg.get_active_bits(_mask_length(msg))
         self.violated_outputs = output_states
         _LOGGER.debug(
             "Output states: %s, monitored outputs: %s",
@@ -294,7 +320,9 @@ class AsyncSatel:
             now = loop.time()
             last_outbound_activity = self._connection.last_outbound_activity
 
-            if last_outbound_activity is None:
+            if last_outbound_activity is None or not self.connected:
+                # While disconnected a stale activity timestamp gave a deadline in the past -> sleep(0) in a loop;
+                # wait a full interval from now (as when there is no timestamp)
                 last_outbound_activity = now
 
             # Sleep until next possible interval
@@ -313,6 +341,22 @@ class AsyncSatel:
                 return
             if not self.connected:
                 _LOGGER.debug("Keepalive suppressed because the connection is down")
+                continue
+
+            # Half-open connection: we send, but nothing arrives. The panel answers every
+            # command (protocol description) and keepalive asks every KEEPALIVE_INTERVAL s, so silence
+            # longer than INBOUND_SILENCE_S means a dead link. Previously only outbound traffic was checked.
+            if (
+                self._last_inbound is not None
+                and self._last_inbound_generation == self._connection.generation
+                and now - self._last_inbound > INBOUND_SILENCE_S
+            ):
+                _LOGGER.warning(
+                    "No data from the panel for %.0fs - dropping the connection to reconnect",
+                    now - self._last_inbound,
+                )
+                self._last_inbound = None
+                await self._connection.disconnect()
                 continue
 
             if (observed := self._connection.last_outbound_activity) is not None:
@@ -376,11 +420,21 @@ class AsyncSatel:
                 if not msg:
                     continue
 
+                self._last_inbound = asyncio.get_running_loop().time()
+                self._last_inbound_generation = self._connection.generation
+
                 self._queue.on_message_received(msg)
 
                 if msg.cmd in self._message_handlers:
                     _LOGGER.debug("Calling handler for command: %s", msg.cmd)
-                    self._message_handlers[msg.cmd](msg)
+                    # An exception while handling ONE frame must not end the reading loop - previously
+                    # the loop exited with TCP still open: no reconnection and no more data.
+                    try:
+                        self._message_handlers[msg.cmd](msg)
+                    except Exception as ex:  # noqa: BLE001
+                        _LOGGER.warning(
+                            "Frame %s dropped: handler failed: %s", msg.cmd, ex
+                        )
                 else:
                     _LOGGER.debug("No handler for command: %s", msg.cmd)
 
@@ -392,17 +446,46 @@ class AsyncSatel:
             _LOGGER.exception("Error in _reading_loop loop, %s", ex)
 
     async def _monitor_reconnection_loop(self):
-        """Monitor for reconnection events and reinitialize monitoring.
+        """Keep monitoring enabled on EVERY connection.
 
-        This task is only created when monitoring is enabled, so we can assume
-        monitoring should be restarted on reconnection.
+        Previously 0x7F (+12 bytes) was sent once after a reconnection; if the ETHM did not
+        answer within 5 s, the loop waited for the NEXT disconnection - while keepalive kept the
+        connection alive, so consumers saw a connected panel with frozen state. Now:
+        - retry on the current connection (1, 2, 4 ... 30 s) until it succeeds or the connection changes;
+        - wait for a connection generation, not a one-shot event, so a reconnection is never missed;
+        - every MONITORING_REFRESH_S re-send 0x7F (+12 bytes): per the protocol the module then re-sends the
+          state of all monitored commands, so any lost update is recovered.
         """
         while True:
+            if self._connection.stopped:
+                return
             try:
-                # Wait indefinitely for a reconnection event
-                await self._connection.wait_reconnected()
-                _LOGGER.info("Connection re-established, reinitializing monitoring...")
-                await self.start_monitoring()
+                if (
+                    self._connection.connected
+                    and self._monitoring_generation != self._connection.generation
+                ):
+                    await self._start_monitoring_until_ok()
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self._connection.wait_generation_after(
+                            self._connection.generation
+                        ),
+                        MONITORING_REFRESH_S,
+                    )
+                except asyncio.TimeoutError:
+                    # same connection for MONITORING_REFRESH_S - refresh monitoring and the full state
+                    if self._connection.connected:
+                        try:
+                            await self.start_monitoring()
+                        except (SatelMonitoringStartError, SatelConnectionStoppedError):
+                            raise
+                        except Exception as ex:  # noqa: BLE001
+                            _LOGGER.warning("Monitoring refresh failed: %s", ex)
+                            self._monitoring_generation = -1
+            except SatelMonitoringStartError as ex:
+                _LOGGER.warning("Monitoring refresh not acknowledged: %s", ex)
+                self._monitoring_generation = -1
             except SatelConnectionStoppedError:
                 return
             except asyncio.CancelledError:
@@ -410,6 +493,27 @@ class AsyncSatel:
             except Exception as ex:
                 _LOGGER.exception("Error in _monitor_reconnection: %s", ex)
                 await asyncio.sleep(1)
+
+    async def _start_monitoring_until_ok(self) -> None:
+        """Enable monitoring on the current connection, retrying until it succeeds or the connection changes."""
+        generation = self._connection.generation
+        delay = 1.0
+        while self._connection.connected and self._connection.generation == generation:
+            try:
+                await self.start_monitoring()
+                _LOGGER.info("Monitoring enabled on connection %s", generation)
+                return
+            except SatelConnectionStoppedError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - any failure is a reason to retry
+                _LOGGER.warning(
+                    "Monitoring start failed on connection %s (%s), retrying in %.0fs",
+                    generation,
+                    ex,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
 
     def register_callbacks(
         self,
@@ -439,6 +543,15 @@ class AsyncSatel:
         if self._connection_unavailable_logged:
             _LOGGER.info("Connection to Satel Integra panel restored")
             self._connection_unavailable_logged = False
+
+    @property
+    def monitoring_ready(self) -> bool:
+        """Connected AND monitoring acknowledged on THIS connection (data is really flowing).
+        A TCP connection alone is not enough: entities looked available while their state was frozen."""
+        return (
+            self.connected
+            and self._monitoring_generation == self._connection.generation
+        )
 
     def add_connection_status_callback(
         self, callback: ConnectionStateCallback
@@ -488,13 +601,31 @@ class AsyncSatel:
                   + 16/32 bytes - output list
                   If function is accepted, function result can be
                   checked by observe the system state """
-        _LOGGER.debug("Turn on, output: %s, code: %s", output_id, code)
+        # Never log the user code
+        _LOGGER.debug("Set output %s → %s", output_id, state)
 
         mode_command = (
             SatelWriteCommand.OUTPUTS_ON if state else SatelWriteCommand.OUTPUTS_OFF
         )
         msg = SatelWriteMessage(mode_command, code=code, zones_or_outputs=[output_id])
         await self._send_data(msg)
+
+    async def set_output_confirmed(self, code, output_id, state) -> SatelCommandResult:
+        """Send 0x88/0x89 and wait for the 0xEF result ("INT-RS module returns an answer on
+        every command"). Rejection -> SatelCommandRejectedError (code in `.result`), no answer ->
+        SatelNoResponseError. 0xEF 00/FF only means "accepted" - the output state is confirmed by 0x17
+        ("function result can be checked by observe the system state"), which is up to the caller."""
+        _LOGGER.debug("Set output %s → %s (confirmed)", output_id, state)
+        mode_command = (
+            SatelWriteCommand.OUTPUTS_ON if state else SatelWriteCommand.OUTPUTS_OFF
+        )
+        msg = SatelWriteMessage(mode_command, code=code, zones_or_outputs=[output_id])
+        result = await self._send_data_and_wait(msg, SatelCommandResult)
+        if result is None:
+            raise SatelNoResponseError(
+                f"No result from the panel for output {output_id}"
+            )
+        return result
 
     async def read_temperature(self, zone_id: int) -> float | None:
         """Read the temperature for a single zone sensor."""
@@ -691,7 +822,9 @@ class AsyncSatel:
         """Encodes and actually sends message."""
         data = msg.encode_frame()
 
-        await self._connection.send_frame(data)
+        # An unsent frame is an error, not a silent success (False from send_frame was ignored)
+        if not await self._connection.send_frame(data):
+            raise SatelNotConnectedError("Frame not sent - no connection")
 
     async def _read_data(self) -> SatelReadMessage | None:
         """Read data from the alarm."""

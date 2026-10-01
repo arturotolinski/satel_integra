@@ -53,6 +53,10 @@ class SatelConnection:
         self._had_connection = False
         self._last_outbound_activity: float | None = None
         self._generation = 0
+        # Replaced on EVERY successful connection (never cleared by waiters).
+        # `wait_reconnected()` cleared a shared event and lost a reconnection that happened while
+        # monitoring was being enabled.
+        self._new_connection_event = asyncio.Event()
 
     @property
     def connected(self) -> bool:
@@ -84,6 +88,10 @@ class SatelConnection:
     ) -> UnsubscribeCallback:
         """Register a connection-state callback and return a function to remove it."""
         return self._transport.add_connection_state_callback(callback)
+
+    async def notify_state_changed(self) -> None:
+        """Notify connection state listeners (e.g. when monitoring became ready)."""
+        await self._transport._notify_connection_state_changed()
 
     def _now(self) -> float:
         """Return the running loop's monotonic time for interval tracking."""
@@ -146,6 +154,11 @@ class SatelConnection:
 
         _LOGGER.debug("Connected to Satel Integra.")
         self._generation += 1
+        zdarzenie, self._new_connection_event = (
+            self._new_connection_event,
+            asyncio.Event(),
+        )
+        zdarzenie.set()
         # If we've had a successful connection before, this is a
         # reconnection — signal any waiters. Otherwise mark that we've
         # now had a connection so future connects can be treated as
@@ -238,6 +251,24 @@ class SatelConnection:
         """Drop the current transport without terminally stopping the client."""
         async with self._connection_lock:
             await self._close_locked(stop=False)
+
+    async def wait_generation_after(self, generation: int) -> int:
+        """Wait until the connection generation exceeds `generation` and return it.
+        Does not miss connections made between calls. Raises when the connection is stopped."""
+        while self._generation <= generation:
+            self._assert_not_stopped()
+            reconnected = asyncio.create_task(self._new_connection_event.wait())
+            stop = asyncio.create_task(self._stopped_event.wait())
+            try:
+                await asyncio.wait(
+                    {reconnected, stop}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for t in (reconnected, stop):
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(reconnected, stop, return_exceptions=True)
+        return self._generation
 
     async def wait_reconnected(self) -> None:
         """Wait for connection to be re-established after being lost.

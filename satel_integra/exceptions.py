@@ -58,3 +58,17 @@ class SatelCommandRejectedError(SatelIntegraError):
 
 class SatelMonitoringStartError(SatelIntegraError):
     """Raised when monitoring startup receives no successful acknowledgement."""
+
+
+class SatelNotConnectedError(SatelConnectionError):
+    """Command rejected because there is no connection to the panel (it is not queued until reconnection)."""
+
+
+class SatelCommandExpiredError(SatelConnectionError):
+    """Control command expired or was issued on a connection that no longer exists -
+    it was not sent. Control commands are never sent late after a reconnection."""
+
+
+class SatelNoResponseError(SatelIntegraError):
+    """The panel did not acknowledge the command (no 0xEF in time) - the command may not have been
+    executed, or the answer was lost; check the device state before retrying."""

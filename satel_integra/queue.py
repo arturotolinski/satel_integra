@@ -5,16 +5,31 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from satel_integra.commands import SatelReadCommand, expected_response_command
-from satel_integra.const import MESSAGE_RESPONSE_TIMEOUT
+from satel_integra.const import CONTROL_COMMAND_TTL_S, MESSAGE_RESPONSE_TIMEOUT
+from satel_integra.exceptions import SatelCommandExpiredError, SatelNotConnectedError
 from satel_integra.messages import SatelReadMessage, SatelWriteMessage
 
 _LOGGER = logging.getLogger(__name__)
 
 
+# Commands that act on the premises (arming, disarming, outputs, zones) - protocol: 0x80-0xA3
+# with a user code. Only these have a TTL and are bound to a connection.
+def _is_control_command(cmd: int) -> bool:
+    return 0x80 <= int(cmd) <= 0xA3 and int(cmd) not in (0x8C, 0x8F)
+
+
 class QueuedMessage:
-    def __init__(self, message: SatelWriteMessage, wait_for_result: bool):
+    def __init__(
+        self,
+        message: SatelWriteMessage,
+        wait_for_result: bool,
+        generation: int | None = None,
+    ):
         self.message = message
         self.return_result = wait_for_result
+        self.created = asyncio.get_running_loop().time()
+        self.generation = generation
+        self.control = _is_control_command(message.cmd)
 
         self.processed_future: asyncio.Future[SatelReadMessage | None] = (
             asyncio.get_running_loop().create_future()
@@ -26,12 +41,19 @@ class QueuedMessage:
 class SatelMessageQueue:
     """Queue ensuring write commands are sent sequentially and wait for a result."""
 
-    def __init__(self, send_func: Callable[[SatelWriteMessage], Awaitable[None]]):
+    def __init__(
+        self,
+        send_func: Callable[[SatelWriteMessage], Awaitable[None]],
+        connected: Callable[[], bool] = lambda: True,
+        generation: Callable[[], int] = lambda: 0,
+    ):
         """
         Args:
             send_func: coroutine function to send a frame, e.g. AsyncSatel._send_data
         """
         self._send_func: Callable[[SatelWriteMessage], Awaitable[None]] = send_func
+        self._connected = connected
+        self._generation = generation
         self._queue: asyncio.Queue[QueuedMessage] = asyncio.Queue()
 
         self._current_message: QueuedMessage | None = None
@@ -67,7 +89,15 @@ class SatelMessageQueue:
 
         _LOGGER.debug("Queueing message: %s", msg)
 
-        queued = QueuedMessage(msg, wait_for_result)
+        # A control command without a connection fails IMMEDIATELY. Previously it was
+        # queued without a deadline - after reconnection stale gate commands were sent
+        # every 5 s, when nobody expected them.
+        if _is_control_command(msg.cmd) and not self._connected():
+            raise SatelNotConnectedError(
+                "Not connected to the panel - command not sent"
+            )
+
+        queued = QueuedMessage(msg, wait_for_result, self._generation())
         await self._queue.put(queued)
 
         if not wait_for_result:
@@ -123,6 +153,30 @@ class SatelMessageQueue:
 
     async def _send_and_wait_response(self, queued: QueuedMessage) -> None:
         """Send a queued message and wait for its response."""
+
+        if queued.control:
+            age = asyncio.get_running_loop().time() - queued.created
+            reason = None
+            if not self._connected():
+                reason = "no connection"
+            elif (
+                queued.generation is not None
+                and queued.generation != self._generation()
+            ):
+                reason = "connection changed since the command was issued"
+            elif age > CONTROL_COMMAND_TTL_S:
+                reason = f"waited {age:.1f}s in queue"
+            if reason:
+                _LOGGER.warning(
+                    "Control command %s dropped, not sent: %s",
+                    queued.message.cmd,
+                    reason,
+                )
+                if not queued.processed_future.done():
+                    queued.processed_future.set_exception(
+                        SatelCommandExpiredError(reason)
+                    )
+                return
 
         try:
             _LOGGER.debug("Sending message: %s", queued.message)

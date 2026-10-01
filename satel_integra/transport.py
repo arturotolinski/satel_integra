@@ -12,6 +12,7 @@ from satel_integra.const import (
 from satel_integra.encryption import EncryptedCommunicationHandler
 from satel_integra.exceptions import SatelConnectFailedError
 
+TCP_CONNECT_TIMEOUT_S = 10
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -88,8 +89,10 @@ class SatelBaseTransport:
         """Establish TCP connection."""
 
         try:
-            self._reader, self._writer = await asyncio.open_connection(
-                self._host, self._port
+            # Bounded: without a timeout a connect to an unreachable ETHM hung for the OS timeout
+            # (~2 min) while holding the connection lock, and close/reload had to wait for it.
+            self._reader, self._writer = await asyncio.wait_for(
+                asyncio.open_connection(self._host, self._port), TCP_CONNECT_TIMEOUT_S
             )
             _LOGGER.debug("TCP connection established to %s:%s", self._host, self._port)
             await self._set_connection_state(True)
